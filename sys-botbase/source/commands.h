@@ -77,6 +77,6 @@ void key(HiddbgKeyboardAutoPilotState* states, u64 sequentialCount);
 void clickSequence(char* seq, u8* token);
 void dateSkip();
 void dateSkip2();
-void dateSkip3(uint64_t* date);
+void dateSkip3(uint64_t date);
 void resetTime();
 void sendUsbResponse(USBResponse response);

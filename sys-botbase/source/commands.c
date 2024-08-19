@@ -587,9 +587,9 @@ void dateSkip2()
         fatalThrow(ts);
 }
 
-void dateSkip3(uint64_t* date)
+void dateSkip3(uint64_t date)
 {
-    Result ts = timeSetCurrentTime(TimeType_NetworkSystemClock, (uint64_t)(&date)); //Set new time, by replacing it with `sed`..
+    Result ts = timeSetCurrentTime(TimeType_NetworkSystemClock, date); //Set new time, by replacing it with `sed`..
     if (R_FAILED(ts))
         fatalThrow(ts);
 }
