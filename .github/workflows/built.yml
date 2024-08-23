@@ -31,6 +31,8 @@ jobs:
     
     - name: Built
       run: |
+        echo '${{ steps.date.outputs.DATE }}.${{ github.run_number }}'
+        echo "${{ steps.date.outputs.DATE }}.${{ github.run_number }}"
         sed -i "s/insert_version_here/${{ steps.date.outputs.DATE }}.${{ github.run_number }}/g" sys-botbase/source/main.c
         make all
         ls -la
