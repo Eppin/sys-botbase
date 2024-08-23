@@ -18,14 +18,24 @@ jobs:
       run:
         shell: bash
 
+    permissions:
+      contents: write
+
     steps:
     - uses: actions/checkout@v4
+
+    # Get current date for release naming
+    - name: Get current date
+      id: date
+      run: echo "DATE=$(date +'%y.%m.%d')" >> $ENV:GITHUB_OUTPUT
     
     - name: Built
-      run: make all
+      run: |
+        sed -i "s/insert_version_here/${{ steps.date.outputs.DATE }}.${{ github.run_number }}/g" sys-botbase/source/main.c
+        make all
 
     - name: Upload built files
       uses: actions/upload-artifact@v4
       with:
         name: sdcard
-        path: ./sys-botbase/sys-botbase.*
+        path: ./
