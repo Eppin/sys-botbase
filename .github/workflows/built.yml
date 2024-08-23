@@ -27,15 +27,12 @@ jobs:
     # Get current date for release naming
     - name: Get current date
       id: date
-      run: echo "DATE=$(date +'%y.%m.%d')" >> $ENV:GITHUB_OUTPUT
+      run: echo "DATE=$(date +'%y.%m.%d')" >> "$GITHUB_OUTPUT"
     
     - name: Built
       run: |
-        echo '${{ steps.date.outputs.DATE }}.${{ github.run_number }}'
-        echo "${{ steps.date.outputs.DATE }}.${{ github.run_number }}"
         sed -i "s/insert_version_here/${{ steps.date.outputs.DATE }}.${{ github.run_number }}/g" sys-botbase/source/main.c
         make all
-        ls -la
 
     - name: Upload built files
       uses: actions/upload-artifact@v4
