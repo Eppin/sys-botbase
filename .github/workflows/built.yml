@@ -33,6 +33,7 @@ jobs:
       run: |
         sed -i "s/insert_version_here/${{ steps.date.outputs.DATE }}.${{ github.run_number }}/g" sys-botbase/source/main.c
         make all
+        ls -la
 
     - name: Upload built files
       uses: actions/upload-artifact@v4
