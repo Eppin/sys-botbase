@@ -28,14 +28,31 @@ jobs:
     - name: Get current date
       id: date
       run: echo "DATE=$(date +'%y.%m.%d')" >> "$GITHUB_OUTPUT"
-    
+
+    # Replace version number and build
     - name: Built
       run: |
         sed -i "s/insert_version_here/${{ steps.date.outputs.DATE }}.${{ github.run_number }}/g" sys-botbase/source/main.c
         make all
+        cp ./sys-botbase/sys-botbase.nsp ./release/atmosphere/contents/430000000000000B/exefs.nsp
 
+    # Upload  compiled files
     - name: Upload built files
       uses: actions/upload-artifact@v4
       with:
         name: sdcard
-        path: ./
+        path: ./sys-botbase/sys-botbase*
+
+    # ZIP release folder
+    - name: ZIP
+      run: cd release && zip -r atmosphere.zip ./*
+        
+    # Create release
+    - name: Release 
+      uses: softprops/action-gh-release@v1
+      if: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}
+      with:
+        tag_name: ${{ steps.date.outputs.DATE }}.${{ github.run_number }}
+        prerelease: false
+        body: Release, compare Git commits.
+        files: release/atmosphere.zip
