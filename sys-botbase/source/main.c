@@ -15,8 +15,9 @@
 #include <poll.h>
 
 #define TITLE_ID 0x430000000000000B
-#define HEAP_SIZE 0x00400000
+#define HEAP_SIZE 0x00480000
 #define THREAD_SIZE 0x1A000
+#define VERSION_S "2.4"
 
 typedef enum
 {
@@ -67,8 +68,8 @@ TimeServiceType __nx_time_service_type = TimeServiceType_System;
 void __libnx_initheap(void)
 {
     static u8 inner_heap[HEAP_SIZE];
-    extern void *fake_heap_start;
-    extern void *fake_heap_end;
+    extern void* fake_heap_start;
+    extern void* fake_heap_end;
 
     // Configure the newlib heap.
     fake_heap_start = inner_heap;
@@ -693,13 +694,13 @@ int argmain(int argc, char **argv)
     {
         if (usb)
         {
-            char buf[] = "2.353\n";
+            char buf[] = "2.4\n";
             response.data = buf;
             response.size = sizeof(buf);
             sendUsbResponse(response);
         }
         else
-            printf("2.353\n");
+            printf("%s\n", VERSION_S);
     }
 
     // follow pointers and print absolute offset (little endian, flip it yourself if required)
