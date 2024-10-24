@@ -4,7 +4,7 @@ on:
   push:
     branches: [ "*" ]
   pull_request:
-    branches: [ "master" ]
+    branches: [ "main" ]
 
 jobs:
   build:
@@ -62,7 +62,7 @@ jobs:
     # Create release
     - name: Release 
       uses: softprops/action-gh-release@v1
-      if: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/master' }}
+      if: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}
       with:
         tag_name: ${{ steps.version.outputs.VERSION }}
         prerelease: false
