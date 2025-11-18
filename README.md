@@ -1,11 +1,12 @@
-# sys-botbase
+# sys-botbase merged with usb-botbase
 
-A Nintendo Switch (CFW) sys-module that allows users to remote control their switch via sockets as well as read and write to a games memory. This can be used to create bots for games and other fun automation projects.
+A Nintendo Switch (CFW) sys-module that allows users to remote control their Switch via sockets or USB via a config file, as well as read and write to a game's memory. This can be used to create bots for games and other fun automation projects.
 
 ## Features:
 
 ### Fork changes
 
+- USB support based on [Koi-3088's](https://github.com/Koi-3088/usb-botbase) fork
 - New command `dateSet {arg}`, where the argument `{arg}` is Unix Timestamp to be set.
 - New command `resetTime`, `resetTimeNTP`, `getUnixTime` and `getCurrentTime`
 
@@ -31,10 +32,13 @@ A Nintendo Switch (CFW) sys-module that allows users to remote control their swi
 This project was created for the purpose of development for bot automation. The creators and maintainers of this project are not liable for any damages caused or bans received. Use at your own risk.
 
 ## Installation
+1. Download [latest release](https://github.com/Eppin/sys-botbase/releases/latest) and extract into your Nintendo Switch SD card.
+2. Open the `config.cfg` located in `atmosphere/contents/43000000000B` using your favorite text editor.
+3. Set text to `wifi` if you want to connect wirelessly using sockets, or `usb` if you want to connect using a USB cable. Defaults to `wifi`.
+4. Restart your Switch.
+5. Follow [Sysbot.NET's usb-botbase setup guide](https://github.com/kwsch/SysBot.NET/wiki/Configuring-a-new-USB-Connection).
 
-Download [latest release](https://github.com/Eppin/sys-botbase/releases/latest) and extract into your Nintendo Switch SD card. Restart your switch.
-
-When installed correctly, sys-botbase will make your docked joy-con's home button glow on switch bootup. If this does not happen, sys-botbase is not installed correctly.
+When installed correctly, usb-botbase will make your docked joy-con's home button glow on switch bootup. If this does not happen, usb-botbase is not installed correctly.
 
 ![](joycon-glow.gif)
 
@@ -43,4 +47,5 @@ When installed correctly, sys-botbase will make your docked joy-con's home butto
 - Big thank you to [jakibaki](https://github.com/jakibaki/sys-netcheat) for a great sysmodule base to learn and work with, as well as being helpful on the Reswitched discord!
 - Thanks to RTNX on discord for bringing to my attention a nasty little bug that would very randomly cause RAM poking to go bad and the switch (sometimes) crashing as a result.
 - Thanks to Anubis for stress testing!
-- And thanks to olliz0r!
+- Thanks to FishGuy for the initial USB-Botbase implementation.
+- And thanks to olliz0r and Koi-3088!
