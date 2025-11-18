@@ -13,6 +13,8 @@
 #include "util.h"
 #include "freeze.h"
 #include <poll.h>
+#include <time.h>
+#include "ntp.h"
 
 #define TITLE_ID 0x430000000000000B
 #define HEAP_SIZE 0x00480000
@@ -29,21 +31,29 @@ typedef enum {
 Thread freezeThread, touchThread, keyboardThread, clickThread;
 
 // prototype thread functions to give the illusion of cleanliness
-void sub_freeze(void *arg);
-void sub_touch(void *arg);
-void sub_key(void *arg);
-void sub_click(void *arg);
+void sub_freeze(void* arg);
+void sub_touch(void* arg);
+void sub_key(void* arg);
+void sub_click(void* arg);
+void usbMainLoop();
+void wifiMainLoop();
+bool isUSB();
+bool handle_connection();
+void handle_disconnect();
+bool isConnectedToInternet(USBResponse* response);
+void sendResult(uint16_t success, USBResponse* response);
 
 // locks for thread
 Mutex freezeMutex, touchMutex, keyMutex, clickMutex;
 
 // events for releasing or idling threads
-FreezeThreadState freeze_thr_state = Active; 
+FreezeThreadState freeze_thr_state = Active;
 u8 clickThreadState = 0; // 1 = break thread
 // key and touch events currently being processed
-KeyData currentKeyEvent = {0};
-TouchData currentTouchEvent = {0};
+KeyData currentKeyEvent = { 0 };
+TouchData currentTouchEvent = { 0 };
 char* currentClick = NULL;
+bool usb = false;
 
 // for cancelling the touch/click thread
 u8 touchToken = 0;
@@ -55,28 +65,29 @@ int fd_size = 5;
 
 // we aren't an applet
 u32 __nx_applet_type = AppletType_None;
-
 TimeServiceType __nx_time_service_type = TimeServiceType_System;
 
 // we override libnx internals to do a minimal init
 void __libnx_initheap(void)
 {
-	static u8 inner_heap[HEAP_SIZE];
+    static u8 inner_heap[HEAP_SIZE];
     extern void* fake_heap_start;
     extern void* fake_heap_end;
 
     // Configure the newlib heap.
     fake_heap_start = inner_heap;
-    fake_heap_end   = inner_heap + sizeof(inner_heap);
+    fake_heap_end = inner_heap + sizeof(inner_heap);
 }
 
 void __appInit(void)
 {
     Result rc;
     svcSleepThread(20000000000L);
+
     rc = smInitialize();
     if (R_FAILED(rc))
         fatalThrow(rc);
+
     if (hosversionGet() == 0) {
         rc = setsysInitialize();
         if (R_SUCCEEDED(rc)) {
@@ -87,6 +98,7 @@ void __appInit(void)
             setsysExit();
         }
     }
+
     rc = timeInitialize();
     if (R_FAILED(rc))
     {
@@ -96,21 +108,35 @@ void __appInit(void)
         if (R_FAILED(rc))
             fatalThrow(rc);
     }
+
     rc = pmdmntInitialize();
-	if (R_FAILED(rc)) 
-        fatalThrow(rc);
-    rc = ldrDmntInitialize();
-	if (R_FAILED(rc)) 
-		fatalThrow(rc);
-    rc = pminfoInitialize();
-	if (R_FAILED(rc)) 
-		fatalThrow(rc);
-    rc = socketInitializeDefault();
     if (R_FAILED(rc))
         fatalThrow(rc);
+
+    rc = ldrDmntInitialize();
+    if (R_FAILED(rc))
+        fatalThrow(rc);
+
+    rc = pminfoInitialize();
+    if (R_FAILED(rc))
+        fatalThrow(rc);
+
+    rc = fsInitialize();
+    if (R_FAILED(rc))
+        fatalThrow(rc);
+
+    rc = fsdevMountSdmc();
+    if (R_FAILED(rc))
+        fatalThrow(rc);
+
+    bool success = handle_connection();
+    if (!success)
+        fatalThrow(rc);
+
     rc = capsscInitialize();
     if (R_FAILED(rc))
         fatalThrow(rc);
+
     rc = viInitialize(ViServiceType_Default);
     if (R_FAILED(rc))
         fatalThrow(rc);
@@ -119,22 +145,24 @@ void __appInit(void)
 void __appExit(void)
 {
     smExit();
-    nsExit();
-    audoutExit();
-    socketExit();
+    timeExit();
+    pmdmntExit();
+    ldrDmntExit();
+    pminfoExit();
+    handle_disconnect();
+    capsscExit();
     viExit();
 }
 
 u64 mainLoopSleepTime = 50;
 u64 freezeRate = 3;
 bool debugResultCodes = false;
-
 bool echoCommands = false;
 
 void makeTouch(HidTouchState* state, u64 sequentialCount, u64 holdTime, bool hold)
 {
     mutexLock(&touchMutex);
-    memset(&currentTouchEvent, 0, sizeof currentTouchEvent);
+    memset(&currentTouchEvent, 0, sizeof(currentTouchEvent));
     currentTouchEvent.states = state;
     currentTouchEvent.sequentialCount = sequentialCount;
     currentTouchEvent.holdTime = holdTime;
@@ -146,7 +174,7 @@ void makeTouch(HidTouchState* state, u64 sequentialCount, u64 holdTime, bool hol
 void makeKeys(HiddbgKeyboardAutoPilotState* states, u64 sequentialCount)
 {
     mutexLock(&keyMutex);
-    memset(&currentKeyEvent, 0, sizeof currentKeyEvent);
+    memset(&currentKeyEvent, 0, sizeof(currentKeyEvent));
     currentKeyEvent.states = states;
     currentKeyEvent.sequentialCount = sequentialCount;
     currentKeyEvent.state = 1;
@@ -160,20 +188,19 @@ void makeClickSeq(char* seq)
     mutexUnlock(&clickMutex);
 }
 
-int argmain(int argc, char **argv)
+int argmain(int argc, char** argv)
 {
     if (argc == 0)
         return 0;
 
-
+    USBResponse response;
     //peek <address in hex or dec> <amount of bytes in hex or dec>
     if (!strcmp(argv[0], "peek"))
     {
-        if(argc != 3)
+        if (argc != 3)
             return 0;
 
         MetaData meta = getMetaData();
-
         u64 offset = parseStringToInt(argv[1]);
         u64 size = parseStringToInt(argv[2]);
         peekInfinite(meta.heap_base + offset, size);
@@ -181,26 +208,26 @@ int argmain(int argc, char **argv)
 
     if (!strcmp(argv[0], "peekMulti"))
     {
-        if(argc < 3 || argc % 2 == 0)
+        if (argc < 3 || argc % 2 == 0)
             return 0;
 
         MetaData meta = getMetaData();
 
-        u64 itemCount = (argc - 1)/2;
+        u64 itemCount = (argc - 1) / 2;
         u64 offsets[itemCount];
         u64 sizes[itemCount];
 
         for (int i = 0; i < itemCount; ++i)
         {
-            offsets[i] = meta.heap_base + parseStringToInt(argv[(i*2)+1]);
-            sizes[i] = parseStringToInt(argv[(i*2)+2]);
+            offsets[i] = meta.heap_base + parseStringToInt(argv[(i * 2) + 1]);
+            sizes[i] = parseStringToInt(argv[(i * 2) + 2]);
         }
         peekMulti(offsets, sizes, itemCount);
     }
 
     if (!strcmp(argv[0], "peekAbsolute"))
     {
-        if(argc != 3)
+        if (argc != 3)
             return 0;
 
         u64 offset = parseStringToInt(argv[1]);
@@ -210,28 +237,27 @@ int argmain(int argc, char **argv)
 
     if (!strcmp(argv[0], "peekAbsoluteMulti"))
     {
-        if(argc < 3 || argc % 2 == 0)
+        if (argc < 3 || argc % 2 == 0)
             return 0;
 
-        u64 itemCount = (argc - 1)/2;
+        u64 itemCount = (argc - 1) / 2;
         u64 offsets[itemCount];
         u64 sizes[itemCount];
 
         for (int i = 0; i < itemCount; ++i)
         {
-            offsets[i] = parseStringToInt(argv[(i*2)+1]);
-            sizes[i] = parseStringToInt(argv[(i*2)+2]);
+            offsets[i] = parseStringToInt(argv[(i * 2) + 1]);
+            sizes[i] = parseStringToInt(argv[(i * 2) + 2]);
         }
         peekMulti(offsets, sizes, itemCount);
     }
 
     if (!strcmp(argv[0], "peekMain"))
     {
-        if(argc != 3)
+        if (argc != 3)
             return 0;
 
         MetaData meta = getMetaData();
-
         u64 offset = parseStringToInt(argv[1]);
         u64 size = parseStringToInt(argv[2]);
         peekInfinite(meta.main_nso_base + offset, size);
@@ -239,19 +265,19 @@ int argmain(int argc, char **argv)
 
     if (!strcmp(argv[0], "peekMainMulti"))
     {
-        if(argc < 3 || argc % 2 == 0)
+        if (argc < 3 || argc % 2 == 0)
             return 0;
 
         MetaData meta = getMetaData();
 
-        u64 itemCount = (argc - 1)/2;
+        u64 itemCount = (argc - 1) / 2;
         u64 offsets[itemCount];
         u64 sizes[itemCount];
 
         for (int i = 0; i < itemCount; ++i)
         {
-            offsets[i] = meta.main_nso_base + parseStringToInt(argv[(i*2)+1]);
-            sizes[i] = parseStringToInt(argv[(i*2)+2]);
+            offsets[i] = meta.main_nso_base + parseStringToInt(argv[(i * 2) + 1]);
+            sizes[i] = parseStringToInt(argv[(i * 2) + 2]);
         }
         peekMulti(offsets, sizes, itemCount);
     }
@@ -259,48 +285,49 @@ int argmain(int argc, char **argv)
     //poke <address in hex or dec> <data in hex or dec>
     if (!strcmp(argv[0], "poke"))
     {
-        if(argc != 3)
+        if (argc != 3)
             return 0;
-            
-        MetaData meta = getMetaData();
 
+        MetaData meta = getMetaData();
         u64 offset = parseStringToInt(argv[1]);
         u64 size = 0;
         u8* data = parseStringToByteBuffer(argv[2], &size);
+
         poke(meta.heap_base + offset, size, data);
         free(data);
-    } 
-    
+    }
+
     if (!strcmp(argv[0], "pokeAbsolute"))
     {
-        if(argc != 3)
+        if (argc != 3)
             return 0;
 
         u64 offset = parseStringToInt(argv[1]);
         u64 size = 0;
         u8* data = parseStringToByteBuffer(argv[2], &size);
+
         poke(offset, size, data);
         free(data);
     }
-        
+
     if (!strcmp(argv[0], "pokeMain"))
     {
-        if(argc != 3)
+        if (argc != 3)
             return 0;
-            
-        MetaData meta = getMetaData();
 
+        MetaData meta = getMetaData();
         u64 offset = parseStringToInt(argv[1]);
         u64 size = 0;
         u8* data = parseStringToByteBuffer(argv[2], &size);
+
         poke(meta.main_nso_base + offset, size, data);
         free(data);
-    } 
+    }
 
     //click <buttontype>
     if (!strcmp(argv[0], "click"))
     {
-        if(argc != 2)
+        if (argc != 2)
             return 0;
         HidNpadButton key = parseStringToButton(argv[1]);
         click(key);
@@ -310,9 +337,9 @@ int argmain(int argc, char **argv)
     //syntax: <button>=click, 'W<number>'=wait/sleep thread, '+<button>'=press button, '-<button>'=release button, '%<x axis>,<y axis>'=move L stick <x axis, y axis>, '&<x axis>,<y axis>'=move R stick <x axis, y axis> 
     if (!strcmp(argv[0], "clickSeq"))
     {
-        if(argc != 2)
+        if (argc != 2)
             return 0;
-        
+
         u64 sizeArg = strlen(argv[1]) + 1;
         char* seqNew = malloc(sizeArg);
         strcpy(seqNew, argv[1]);
@@ -325,7 +352,7 @@ int argmain(int argc, char **argv)
     //hold <buttontype>
     if (!strcmp(argv[0], "press"))
     {
-        if(argc != 2)
+        if (argc != 2)
             return 0;
         HidNpadButton key = parseStringToButton(argv[1]);
         press(key);
@@ -334,7 +361,7 @@ int argmain(int argc, char **argv)
     //release <buttontype>
     if (!strcmp(argv[0], "release"))
     {
-        if(argc != 2)
+        if (argc != 2)
             return 0;
         HidNpadButton key = parseStringToButton(argv[1]);
         release(key);
@@ -343,59 +370,87 @@ int argmain(int argc, char **argv)
     //setStick <left or right stick> <x value> <y value>
     if (!strcmp(argv[0], "setStick"))
     {
-        if(argc != 4)
+        if (argc != 4)
             return 0;
-        
+
         int side = 0;
-        if(!strcmp(argv[1], "LEFT")){
+        if (!strcmp(argv[1], "LEFT")) {
             side = JOYSTICK_LEFT;
-        }else if(!strcmp(argv[1], "RIGHT")){
+        }
+        else if (!strcmp(argv[1], "RIGHT")) {
             side = JOYSTICK_RIGHT;
-        }else{
+        }
+        else {
             return 0;
         }
 
         int dxVal = strtol(argv[2], NULL, 0);
-        if(dxVal > JOYSTICK_MAX) dxVal = JOYSTICK_MAX; //0x7FFF
-        if(dxVal < JOYSTICK_MIN) dxVal = JOYSTICK_MIN; //-0x8000
+        if (dxVal > JOYSTICK_MAX) dxVal = JOYSTICK_MAX; //0x7FFF
+        if (dxVal < JOYSTICK_MIN) dxVal = JOYSTICK_MIN; //-0x8000
         int dyVal = strtol(argv[3], NULL, 0);
-        if(dyVal > JOYSTICK_MAX) dyVal = JOYSTICK_MAX;
-        if(dyVal < JOYSTICK_MIN) dyVal = JOYSTICK_MIN;
+        if (dyVal > JOYSTICK_MAX) dyVal = JOYSTICK_MAX;
+        if (dyVal < JOYSTICK_MIN) dyVal = JOYSTICK_MIN;
 
         setStickState(side, dxVal, dyVal);
     }
 
     //detachController
-    if(!strcmp(argv[0], "detachController"))
+    if (!strcmp(argv[0], "detachController"))
     {
         detachController();
     }
-    if (!strcmp(argv[0], "game")) 
+    if (!strcmp(argv[0], "game"))
     {
         if (argc != 2)
             return 0;
         NsApplicationControlData* buf = (NsApplicationControlData*)malloc(sizeof(NsApplicationControlData));
         u64 outsize = getoutsize(buf);
-        NacpLanguageEntry* langentry = NULL;    
+        NacpLanguageEntry* langentry = NULL;
         if (outsize != 0) {
             if (!strcmp(argv[1], "icon")) {
+                u8* icon = malloc(outsize);
+
                 u64 i;
                 for (i = 0; i < outsize - sizeof(buf->nacp); i++)
                 {
-                    printf("%02X", buf->icon[i]);
+                    u8 ic = buf->icon[i];
+                    if (usb)
+                        icon[i] = ic;
+                    else printf("%02X", ic);
                 }
-                printf("\n");
+                if (usb)
+                {
+                    response.size = outsize;
+                    response.data = &icon[0];
+                    sendUsbResponse(response);
+                }
+                else printf("\n");
+                free(icon);
             }
             if (!strcmp(argv[1], "version"))
             {
                 char version[0x11];
                 memset(version, 0, sizeof(version));
                 strncpy(version, buf->nacp.display_version, sizeof(version));
-                printf("%s\n", version);
+
+                if (usb)
+                {
+                    response.size = sizeof(version);
+                    response.data = &version;
+                    sendUsbResponse(response);
+                }
+                else printf("%s\n", version);
             }
             if (!strcmp(argv[1], "rating"))
             {
-                printf("%d\n", buf->nacp.rating_age[0]);
+                int rating = buf->nacp.rating_age[0];
+                if (usb)
+                {
+                    response.size = sizeof(rating);
+                    response.data = &rating;
+                    sendUsbResponse(response);
+                }
+                else printf("%d\n", rating);
             }
             if (!strcmp(argv[1], "author"))
             {
@@ -403,7 +458,14 @@ int argmain(int argc, char **argv)
                 nacpGetLanguageEntry(&buf->nacp, &langentry);
                 memset(author, 0, sizeof(author));
                 strncpy(author, langentry->author, sizeof(author));
-                printf("%s\n", author);
+
+                if (usb)
+                {
+                    response.size = sizeof(author);
+                    response.data = &author;
+                    sendUsbResponse(response);
+                }
+                else printf("%s\n", author);
             }
             if (!strcmp(argv[1], "name"))
             {
@@ -411,206 +473,292 @@ int argmain(int argc, char **argv)
                 nacpGetLanguageEntry(&buf->nacp, &langentry);
                 memset(name, 0, sizeof(name));
                 strncpy(name, langentry->name, sizeof(name));
-                printf("%s\n", name);
+
+                if (usb)
+                {
+                    response.size = sizeof(name);
+                    response.data = &name;
+                    sendUsbResponse(response);
+                }
+                else printf("%s\n", name);
             }
         }
         free(buf);
     }
     //configure <mainLoopSleepTime or buttonClickSleepTime> <time in ms>
-    if(!strcmp(argv[0], "configure")){
-        if(argc != 3)
+    if (!strcmp(argv[0], "configure")) {
+        if (argc != 3)
             return 0;
 
-        if(!strcmp(argv[1], "mainLoopSleepTime")){
+        if (!strcmp(argv[1], "mainLoopSleepTime")) {
             u64 time = parseStringToInt(argv[2]);
             mainLoopSleepTime = time;
         }
 
-        if(!strcmp(argv[1], "buttonClickSleepTime")){
+        if (!strcmp(argv[1], "buttonClickSleepTime")) {
             u64 time = parseStringToInt(argv[2]);
             buttonClickSleepTime = time;
         }
 
-        if(!strcmp(argv[1], "echoCommands")){
+        if (!strcmp(argv[1], "echoCommands")) {
             u64 shouldActivate = parseStringToInt(argv[2]);
             echoCommands = shouldActivate != 0;
         }
 
-        if(!strcmp(argv[1], "printDebugResultCodes")){
+        if (!strcmp(argv[1], "printDebugResultCodes")) {
             u64 shouldActivate = parseStringToInt(argv[2]);
             debugResultCodes = shouldActivate != 0;
         }
-        
-        if(!strcmp(argv[1], "keySleepTime")){
+
+        if (!strcmp(argv[1], "keySleepTime")) {
             u64 keyTime = parseStringToInt(argv[2]);
             keyPressSleepTime = keyTime;
         }
 
-        if(!strcmp(argv[1], "fingerDiameter")){
-            u32 fDiameter = (u32) parseStringToInt(argv[2]);
+        if (!strcmp(argv[1], "fingerDiameter")) {
+            u32 fDiameter = (u32)parseStringToInt(argv[2]);
             fingerDiameter = fDiameter;
         }
 
-        if(!strcmp(argv[1], "pollRate")){
+        if (!strcmp(argv[1], "pollRate")) {
             u64 fPollRate = parseStringToInt(argv[2]);
             pollRate = fPollRate;
         }
 
-        if(!strcmp(argv[1], "freezeRate")){
+        if (!strcmp(argv[1], "freezeRate")) {
             u64 fFreezeRate = parseStringToInt(argv[2]);
             freezeRate = fFreezeRate;
         }
 
-        if(!strcmp(argv[1], "controllerType")){
+        if (!strcmp(argv[1], "controllerType")) {
             detachController();
             u8 fControllerType = (u8)parseStringToInt(argv[2]);
             controllerInitializedType = fControllerType;
         }
     }
 
-    if(!strcmp(argv[0], "getTitleID")){
+    if (!strcmp(argv[0], "getTitleID")) {
         MetaData meta = getMetaData();
-        printf("%016lX\n", meta.titleID);
+        if (usb)
+        {
+            response.size = sizeof(meta.titleID);
+            response.data = &meta.titleID;
+            sendUsbResponse(response);
+        }
+        else printf("%016lX\n", meta.titleID);
     }
 
-    if(!strcmp(argv[0], "getTitleVersion")){
+    if (!strcmp(argv[0], "getTitleVersion")) {
         MetaData meta = getMetaData();
-        printf("%016lX\n", meta.titleVersion);
+        if (usb)
+        {
+            response.size = sizeof(meta.titleVersion);
+            response.data = &meta.titleVersion;
+            sendUsbResponse(response);
+        }
+        else printf("%016lX\n", meta.titleVersion);
     }
 
-    if(!strcmp(argv[0], "getSystemLanguage")){
+    if (!strcmp(argv[0], "getSystemLanguage")) {
         //thanks zaksa
         setInitialize();
-        u64 languageCode = 0;   
+        u64 languageCode = 0;
         SetLanguage language = SetLanguage_ENUS;
-        setGetSystemLanguage(&languageCode);   
+        setGetSystemLanguage(&languageCode);
         setMakeLanguage(languageCode, &language);
-        printf("%d\n", language);
+        if (usb)
+        {
+            response.size = sizeof(language);
+            response.data = &language;
+            sendUsbResponse(response);
+        }
+        else printf("%d\n", language);
     }
- 
-    if(!strcmp(argv[0], "getMainNsoBase")){
+
+    if (!strcmp(argv[0], "getMainNsoBase")) {
         MetaData meta = getMetaData();
-        printf("%016lX\n", meta.main_nso_base);
+        if (usb)
+        {
+            response.size = sizeof(meta.main_nso_base);
+            response.data = &meta.main_nso_base;
+            sendUsbResponse(response);
+        }
+        else printf("%016lX\n", meta.main_nso_base);
     }
-    
-    if(!strcmp(argv[0], "getBuildID")){
+
+    if (!strcmp(argv[0], "getBuildID")) {
         MetaData meta = getMetaData();
-        printf("%02x%02x%02x%02x%02x%02x%02x%02x\n", meta.buildID[0], meta.buildID[1], meta.buildID[2], meta.buildID[3], meta.buildID[4], meta.buildID[5], meta.buildID[6], meta.buildID[7]);
+        if (usb)
+        {
+            response.size = sizeof(u8);
+            response.data = &meta.buildID;
+            sendUsbResponse(response);
+        }
+        else printf("%02x%02x%02x%02x%02x%02x%02x%02x\n", meta.buildID[0], meta.buildID[1], meta.buildID[2], meta.buildID[3], meta.buildID[4], meta.buildID[5], meta.buildID[6], meta.buildID[7]);
 
     }
 
-    if(!strcmp(argv[0], "getHeapBase")){
+    if (!strcmp(argv[0], "getHeapBase")) {
         MetaData meta = getMetaData();
-        printf("%016lX\n", meta.heap_base);
+        if (usb)
+        {
+            response.size = sizeof(meta.heap_base);
+            response.data = &meta.heap_base;
+            sendUsbResponse(response);
+        }
+        else printf("%016lX\n", meta.heap_base);
     }
 
-    if(!strcmp(argv[0], "isProgramRunning")){
-        if(argc != 2)
+    if (!strcmp(argv[0], "isProgramRunning")) {
+        if (argc != 2)
             return 0;
         u64 programId = parseStringToInt(argv[1]);
         bool isRunning = getIsProgramOpen(programId);
-        printf("%d\n", isRunning);
+        if (usb)
+        {
+            response.size = sizeof(isRunning);
+            response.data = &isRunning;
+            sendUsbResponse(response);
+        }
+        else printf("%d\n", isRunning);
     }
 
-    if(!strcmp(argv[0], "pixelPeek")){
+    if (!strcmp(argv[0], "pixelPeek")) {
         //errors with 0x668CE, unless debugunit flag is patched
         u64 bSize = 0x7D000;
-        char* buf = malloc(bSize); 
+        char* buf = malloc(bSize);
         u64 outSize = 0;
 
         Result rc = capsscCaptureForDebug(buf, bSize, &outSize);
-
         if (R_FAILED(rc) && debugResultCodes)
             printf("capssc, 1204: %d\n", rc);
-        
-        u64 i;
-        for (i = 0; i < outSize; i++)
+
+        if (usb)
         {
-            printf("%02X", buf[i]);
+            response.data = &buf[0];
+            response.size = outSize;
+            sendUsbResponse(response);
         }
-        printf("\n");
+        else
+        {
+            u64 i;
+            for (i = 0; i < outSize; i++)
+            {
+                printf("%02X", buf[i]);
+            }
+            printf("\n");
+        }
 
         free(buf);
     }
 
-    if(!strcmp(argv[0], "getVersion")){
-        printf("%s\n", VERSION_S);
+    if (!strcmp(argv[0], "getVersion")) {
+        if (usb)
+        {
+            response.data = VERSION_S;
+            response.size = sizeof(VERSION_S);
+            sendUsbResponse(response);
+        }
+        else printf("%s\n", VERSION_S);
     }
-	
-	// follow pointers and print absolute offset (little endian, flip it yourself if required)
-	// pointer <first (main) jump> <additional jumps> !!do not add the last jump in pointerexpr here, add it yourself!!
-	if (!strcmp(argv[0], "pointer"))
-	{
-		if(argc < 2)
+
+    // follow pointers and print absolute offset (little endian, flip it yourself if required)
+    // pointer <first (main) jump> <additional jumps> !!do not add the last jump in pointerexpr here, add it yourself!!
+    if (!strcmp(argv[0], "pointer"))
+    {
+        if (argc < 2)
             return 0;
-		s64 jumps[argc-1];
-		for (int i = 1; i < argc; i++)
-			jumps[i-1] = parseStringToSignedLong(argv[i]);
-		u64 solved = followMainPointer(jumps, argc-1);
-		printf("%016lX\n", solved);
-	}
+        s64 jumps[argc - 1];
+        for (int i = 1; i < argc; i++)
+            jumps[i - 1] = parseStringToSignedLong(argv[i]);
+
+        u64 solved = followMainPointer(jumps, argc - 1);
+        if (usb)
+        {
+            response.data = &solved;
+            response.size = sizeof(solved);
+            sendUsbResponse(response);
+        }
+        else printf("%016lX\n", solved);
+    }
 
     // pointerAll <first (main) jump> <additional jumps> <final jump in pointerexpr> 
     // possibly redundant between the one above, one needs to go eventually. (little endian, flip it yourself if required)
-	if (!strcmp(argv[0], "pointerAll"))
-	{
-		if(argc < 3)
+    if (!strcmp(argv[0], "pointerAll"))
+    {
+        if (argc < 3)
             return 0;
-        s64 finalJump = parseStringToSignedLong(argv[argc-1]);
+        s64 finalJump = parseStringToSignedLong(argv[argc - 1]);
         u64 count = argc - 2;
-		s64 jumps[count];
-		for (int i = 1; i < argc-1; i++)
-			jumps[i-1] = parseStringToSignedLong(argv[i]);
-		u64 solved = followMainPointer(jumps, count);
+        s64 jumps[count];
+        for (int i = 1; i < argc - 1; i++)
+            jumps[i - 1] = parseStringToSignedLong(argv[i]);
+
+        u64 solved = followMainPointer(jumps, count);
         if (solved != 0)
             solved += finalJump;
-		printf("%016lX\n", solved);
-	}
-	
-	// pointerRelative <first (main) jump> <additional jumps> <final jump in pointerexpr> 
-	// returns offset relative to heap
-	if (!strcmp(argv[0], "pointerRelative"))
-	{
-		if(argc < 3)
+
+        if (usb)
+        {
+            response.data = &solved;
+            response.size = sizeof(solved);
+            sendUsbResponse(response);
+        }
+        else printf("%016lX\n", solved);
+    }
+
+    // pointerRelative <first (main) jump> <additional jumps> <final jump in pointerexpr> 
+    // returns offset relative to heap
+    if (!strcmp(argv[0], "pointerRelative"))
+    {
+        if (argc < 3)
             return 0;
-        s64 finalJump = parseStringToSignedLong(argv[argc-1]);
+        s64 finalJump = parseStringToSignedLong(argv[argc - 1]);
         u64 count = argc - 2;
-		s64 jumps[count];
-		for (int i = 1; i < argc-1; i++)
-			jumps[i-1] = parseStringToSignedLong(argv[i]);
-		u64 solved = followMainPointer(jumps, count);
+        s64 jumps[count];
+        for (int i = 1; i < argc - 1; i++)
+            jumps[i - 1] = parseStringToSignedLong(argv[i]);
+        u64 solved = followMainPointer(jumps, count);
         if (solved != 0)
         {
             solved += finalJump;
             MetaData meta = getMetaData();
             solved -= meta.heap_base;
         }
-		printf("%016lX\n", solved);
-	}
+
+        if (usb)
+        {
+            response.data = &solved;
+            response.size = sizeof(solved);
+            sendUsbResponse(response);
+        }
+        else printf("%016lX\n", solved);
+    }
 
     // pointerPeek <amount of bytes in hex or dec> <first (main) jump> <additional jumps> <final jump in pointerexpr>
     // warning: no validation
     if (!strcmp(argv[0], "pointerPeek"))
-	{
-		if(argc < 4)
+    {
+        if (argc < 4)
             return 0;
-            
-        s64 finalJump = parseStringToSignedLong(argv[argc-1]);
-		u64 size = parseStringToInt(argv[1]);
+
+        s64 finalJump = parseStringToSignedLong(argv[argc - 1]);
+        u64 size = parseStringToInt(argv[1]);
         u64 count = argc - 3;
-		s64 jumps[count];
-		for (int i = 2; i < argc-1; i++)
-			jumps[i-2] = parseStringToSignedLong(argv[i]);
-		u64 solved = followMainPointer(jumps, count);
+        s64 jumps[count];
+        for (int i = 2; i < argc - 1; i++)
+            jumps[i - 2] = parseStringToSignedLong(argv[i]);
+        u64 solved = followMainPointer(jumps, count);
         solved += finalJump;
+
         peek(solved, size);
-	}
+    }
 
     // pointerPeekMulti <amount of bytes in hex or dec> <first (main) jump> <additional jumps> <final jump in pointerexpr> split by asterisks (*)
     // warning: no validation
     if (!strcmp(argv[0], "pointerPeekMulti"))
-	{
-		if(argc < 4)
+    {
+        if (argc < 4)
             return 0;
 
         // we guess a max of 40 for now
@@ -626,22 +774,22 @@ int argmain(int argc, char **argv)
             // count first
             char* thisArg = argv[currIndex];
             while (strcmp(thisArg, "*"))
-            {   
+            {
                 currIndex++;
                 if (currIndex < argc)
                     thisArg = argv[currIndex];
-                else 
+                else
                     break;
             }
-            
+
             u64 thisCount = currIndex - lastIndex;
-            
-            s64 finalJump = parseStringToSignedLong(argv[currIndex-1]);
+
+            s64 finalJump = parseStringToSignedLong(argv[currIndex - 1]);
             u64 size = parseStringToSignedLong(argv[lastIndex]);
             u64 count = thisCount - 2;
             s64 jumps[count];
-            for (int i = 1; i < count+1; i++)
-                jumps[i-1] = parseStringToSignedLong(argv[i+lastIndex]);
+            for (int i = 1; i < count + 1; i++)
+                jumps[i - 1] = parseStringToSignedLong(argv[i + lastIndex]);
             u64 solved = followMainPointer(jumps, count);
             solved += finalJump;
 
@@ -651,124 +799,124 @@ int argmain(int argc, char **argv)
             currIndex++;
             lastIndex = currIndex;
         }
-        
+
         peekMulti(offsets, sizes, itemCount);
-	}
+    }
 
     // pointerPoke <data to be sent> <first (main) jump> <additional jumps> <final jump in pointerexpr>
     // warning: no validation
     if (!strcmp(argv[0], "pointerPoke"))
-	{
-		if(argc < 4)
+    {
+        if (argc < 4)
             return 0;
-            
-        s64 finalJump = parseStringToSignedLong(argv[argc-1]);
+
+        s64 finalJump = parseStringToSignedLong(argv[argc - 1]);
         u64 count = argc - 3;
-		s64 jumps[count];
-		for (int i = 2; i < argc-1; i++)
-			jumps[i-2] = parseStringToSignedLong(argv[i]);
-		u64 solved = followMainPointer(jumps, count);
+        s64 jumps[count];
+        for (int i = 2; i < argc - 1; i++)
+            jumps[i - 2] = parseStringToSignedLong(argv[i]);
+        u64 solved = followMainPointer(jumps, count);
         solved += finalJump;
 
-		u64 size;
+        u64 size;
         u8* data = parseStringToByteBuffer(argv[1], &size);
         poke(solved, size, data);
         free(data);
-	}
-	
-	// add to freeze map
-	if (!strcmp(argv[0], "freeze"))
+    }
+
+    // add to freeze map
+    if (!strcmp(argv[0], "freeze"))
     {
-        if(argc != 3)
+        if (argc != 3)
             return 0;
-		
-		MetaData meta = getMetaData();
-		
+
+        MetaData meta = getMetaData();
+
         u64 offset = parseStringToInt(argv[1]);
         u64 size = 0;
         u8* data = parseStringToByteBuffer(argv[2], &size);
         addToFreezeMap(offset, data, size, meta.titleID);
     }
-	
-	// remove from freeze map
-	if (!strcmp(argv[0], "unFreeze"))
+
+    // remove from freeze map
+    if (!strcmp(argv[0], "unFreeze"))
     {
-        if(argc != 2)
+        if (argc != 2)
             return 0;
-		
+
         u64 offset = parseStringToInt(argv[1]);
         removeFromFreezeMap(offset);
     }
-	
-	// get count of offsets being frozen
-	if (!strcmp(argv[0], "freezeCount"))
-	{
-		getFreezeCount(true);
-	}
-	
-	// clear all freezes
-	if (!strcmp(argv[0], "freezeClear"))
-	{
-		clearFreezes();
-		freeze_thr_state = Idle;
-	}
+
+    // get count of offsets being frozen
+    if (!strcmp(argv[0], "freezeCount"))
+    {
+        getFreezeCount(true);
+    }
+
+    // clear all freezes
+    if (!strcmp(argv[0], "freezeClear"))
+    {
+        clearFreezes();
+        freeze_thr_state = Idle;
+    }
 
     if (!strcmp(argv[0], "freezePause"))
-		freeze_thr_state = Pause;
+        freeze_thr_state = Pause;
 
     if (!strcmp(argv[0], "freezeUnpause"))
-		freeze_thr_state = Active;
-	
+        freeze_thr_state = Active;
+
     //touch followed by arrayof: <x in the range 0-1280> <y in the range 0-720>. Array is sequential taps, not different fingers. Functions in its own thread, but will not allow the call again while running. tapcount * pollRate * 2
     if (!strcmp(argv[0], "touch"))
-	{
-        if(argc < 3 || argc % 2 == 0)
+    {
+        if (argc < 3 || argc % 2 == 0)
             return 0;
 
-        u32 count = (argc-1)/2;
-		HidTouchState* state = calloc(count, sizeof(HidTouchState));
+        u32 count = (argc - 1) / 2;
+        HidTouchState* state = calloc(count, sizeof(HidTouchState));
         u32 i, j = 0;
         for (i = 0; i < count; ++i)
         {
             state[i].diameter_x = state[i].diameter_y = fingerDiameter;
-            state[i].x = (u32) parseStringToInt(argv[++j]);
-            state[i].y = (u32) parseStringToInt(argv[++j]);
+            state[i].x = (u32)parseStringToInt(argv[++j]);
+            state[i].y = (u32)parseStringToInt(argv[++j]);
         }
 
         makeTouch(state, count, pollRate * 1e+6L, false);
-	}
+    }
 
     //touchHold <x in the range 0-1280> <y in the range 0-720> <time in milliseconds (must be at least 15ms)>. Functions in its own thread, but will not allow the call again while running. pollRate + holdtime
-    if(!strcmp(argv[0], "touchHold")){
-        if(argc != 4)
+    if (!strcmp(argv[0], "touchHold")) {
+        if (argc != 4)
             return 0;
 
         HidTouchState* state = calloc(1, sizeof(HidTouchState));
         state->diameter_x = state->diameter_y = fingerDiameter;
-        state->x = (u32) parseStringToInt(argv[1]);
-        state->y = (u32) parseStringToInt(argv[2]);
+        state->x = (u32)parseStringToInt(argv[1]);
+        state->y = (u32)parseStringToInt(argv[2]);
         u64 time = parseStringToInt(argv[3]);
         makeTouch(state, 1, time * 1e+6L, false);
     }
 
     //touchDraw followed by arrayof: <x in the range 0-1280> <y in the range 0-720>. Array is vectors of where finger moves to, then removes the finger. Functions in its own thread, but will not allow the call again while running. (vectorcount * pollRate * 2) + pollRate
     if (!strcmp(argv[0], "touchDraw"))
-	{
-        if(argc < 3 || argc % 2 == 0)
+    {
+        if (argc < 3 || argc % 2 == 0)
             return 0;
 
-        u32 count = (argc-1)/2;
-		HidTouchState* state = calloc(count, sizeof(HidTouchState));
+        u32 count = (argc - 1) / 2;
+        HidTouchState* state = calloc(count, sizeof(HidTouchState));
         u32 i, j = 0;
         for (i = 0; i < count; ++i)
         {
             state[i].diameter_x = state[i].diameter_y = fingerDiameter;
-            state[i].x = (u32) parseStringToInt(argv[++j]);
-            state[i].y = (u32) parseStringToInt(argv[++j]);
+            state[i].x = (u32)parseStringToInt(argv[++j]);
+            state[i].y = (u32)parseStringToInt(argv[++j]);
         }
 
         makeTouch(state, count, pollRate * 1e+6L * 2, true);
-	}
+    }
 
     if (!strcmp(argv[0], "touchCancel"))
         touchToken = 1;
@@ -776,16 +924,16 @@ int argmain(int argc, char **argv)
     //key followed by arrayof: <HidKeyboardKey> to be pressed in sequential order
     //thank you Red (hp3721) for this functionality
     if (!strcmp(argv[0], "key"))
-	{
+    {
         if (argc < 2)
             return 0;
-        
-        u64 count = argc-1;
-        HiddbgKeyboardAutoPilotState* keystates = calloc(count, sizeof (HiddbgKeyboardAutoPilotState));
+
+        u64 count = argc - 1;
+        HiddbgKeyboardAutoPilotState* keystates = calloc(count, sizeof(HiddbgKeyboardAutoPilotState));
         u64 i;
         for (i = 0; i < count; i++)
         {
-            u8 key = (u8) parseStringToInt(argv[i+1]);
+            u8 key = (u8)parseStringToInt(argv[i + 1]);
             if (key < 4 || key > 231)
                 continue;
             keystates[i].keys[key / 64] = 1UL << key;
@@ -797,20 +945,20 @@ int argmain(int argc, char **argv)
 
     //keyMod followed by arrayof: <HidKeyboardKey> <HidKeyboardModifier>(without the bitfield shift) to be pressed in sequential order
     if (!strcmp(argv[0], "keyMod"))
-	{
+    {
         if (argc < 3 || argc % 2 == 0)
             return 0;
 
-        u32 count = (argc-1)/2;
-        HiddbgKeyboardAutoPilotState* keystates = calloc(count, sizeof (HiddbgKeyboardAutoPilotState));
+        u32 count = (argc - 1) / 2;
+        HiddbgKeyboardAutoPilotState* keystates = calloc(count, sizeof(HiddbgKeyboardAutoPilotState));
         u64 i, j = 0;
         for (i = 0; i < count; i++)
         {
-            u8 key = (u8) parseStringToInt(argv[++j]);
+            u8 key = (u8)parseStringToInt(argv[++j]);
             if (key < 4 || key > 231)
                 continue;
             keystates[i].keys[key / 64] = 1UL << key;
-            keystates[i].modifiers = BIT((u8) parseStringToInt(argv[++j]));
+            keystates[i].modifiers = BIT((u8)parseStringToInt(argv[++j]));
         }
 
         makeKeys(keystates, count);
@@ -818,16 +966,16 @@ int argmain(int argc, char **argv)
 
     //keyMulti followed by arrayof: <HidKeyboardKey> to be pressed at the same time.
     if (!strcmp(argv[0], "keyMulti"))
-	{
+    {
         if (argc < 2)
             return 0;
-        
-        u64 count = argc-1;
-        HiddbgKeyboardAutoPilotState* keystate = calloc(1, sizeof (HiddbgKeyboardAutoPilotState));
+
+        u64 count = argc - 1;
+        HiddbgKeyboardAutoPilotState* keystate = calloc(1, sizeof(HiddbgKeyboardAutoPilotState));
         u64 i;
         for (i = 0; i < count; i++)
         {
-            u8 key = (u8) parseStringToInt(argv[i+1]);
+            u8 key = (u8)parseStringToInt(argv[i + 1]);
             if (key < 4 || key > 231)
                 continue;
             keystate[0].keys[key / 64] |= 1UL << key;
@@ -838,7 +986,7 @@ int argmain(int argc, char **argv)
 
     //turns off the screen (display)
     if (!strcmp(argv[0], "screenOff"))
-	{
+    {
         ViDisplay temp_display;
         Result rc = viOpenDisplay("Internal", &temp_display);
         if (R_FAILED(rc))
@@ -859,7 +1007,7 @@ int argmain(int argc, char **argv)
 
     //turns on the screen (display)
     if (!strcmp(argv[0], "screenOn"))
-	{
+    {
         ViDisplay temp_display;
         Result rc = viOpenDisplay("Internal", &temp_display);
         if (R_FAILED(rc))
@@ -877,21 +1025,34 @@ int argmain(int argc, char **argv)
             lblExit();
         }
     }
-    
+
     if (!strcmp(argv[0], "charge"))
-	{
+    {
         u32 charge;
         Result rc = psmInitialize();
         if (R_FAILED(rc))
             fatalThrow(rc);
         psmGetBatteryChargePercentage(&charge);
-        printf("%d\n", charge);
+
+        if (usb)
+        {
+            response.size = sizeof(u32);
+            response.data = &charge;
+            sendUsbResponse(response);
+        }
+        else printf("%d\n", charge);
         psmExit();
     }
 
     if (!strcmp(argv[0], "fdCount"))
-	{
-        printf("%d\n", fd_count);
+    {
+        if (usb)
+        {
+            response.size = sizeof(int);
+            response.data = &fd_count;
+            sendUsbResponse(response);
+        }
+        else printf("%d\n", fd_count);
     }
 
     if(!strcmp(argv[0], "dateSet"))
@@ -918,7 +1079,7 @@ int argmain(int argc, char **argv)
     return 0;
 }
 
-void add_to_pfds(struct pollfd *pfds[], int newfd, int *fd_count, int *fd_size)
+void add_to_pfds(struct pollfd* pfds[], int newfd, int* fd_count, int* fd_size)
 {
     if (*fd_count == *fd_size) {
         *fd_size *= 2;
@@ -932,21 +1093,73 @@ void add_to_pfds(struct pollfd *pfds[], int newfd, int *fd_count, int *fd_size)
     (*fd_count)++;
 }
 
-void del_from_pfds(struct pollfd pfds[], int i, int *fd_count)
+void del_from_pfds(struct pollfd pfds[], int i, int* fd_count)
 {
-    pfds[i] = pfds[*fd_count-1];
+    pfds[i] = pfds[*fd_count - 1];
 
     (*fd_count)--;
 }
 
 int main()
 {
-    char *linebuf = malloc(sizeof(char) * MAX_LINE_LENGTH);
+    Result rc;
+    initFreezes();
+
+    // freeze thread
+    mutexInit(&freezeMutex);
+    rc = threadCreate(&freezeThread, sub_freeze, (void*)&freeze_thr_state, NULL, THREAD_SIZE, 0x2C, -2);
+    if (R_SUCCEEDED(rc))
+        rc = threadStart(&freezeThread);
+
+    // touch thread
+    mutexInit(&touchMutex);
+    rc = threadCreate(&touchThread, sub_touch, (void*)&currentTouchEvent, NULL, THREAD_SIZE, 0x2C, -2);
+    if (R_SUCCEEDED(rc))
+        rc = threadStart(&touchThread);
+
+    // key thread
+    mutexInit(&keyMutex);
+    rc = threadCreate(&keyboardThread, sub_key, (void*)&currentKeyEvent, NULL, THREAD_SIZE, 0x2C, -2);
+    if (R_SUCCEEDED(rc))
+        rc = threadStart(&keyboardThread);
+
+    // click sequence thread
+    mutexInit(&clickMutex);
+    rc = threadCreate(&clickThread, sub_click, (void*)currentClick, NULL, THREAD_SIZE, 0x2C, -2);
+    if (R_SUCCEEDED(rc))
+        rc = threadStart(&clickThread);
+
+    if (usb)
+        usbMainLoop();
+    else wifiMainLoop();
+
+    if (R_SUCCEEDED(rc))
+    {
+        freeze_thr_state = Exit;
+        threadWaitForExit(&freezeThread);
+        threadClose(&freezeThread);
+        currentTouchEvent.state = 3;
+        threadWaitForExit(&touchThread);
+        threadClose(&touchThread);
+        currentKeyEvent.state = 3;
+        threadWaitForExit(&keyboardThread);
+        threadClose(&keyboardThread);
+        clickThreadState = 1;
+        threadWaitForExit(&clickThread);
+    }
+
+    clearFreezes();
+    freeFreezes();
+    return 0;
+}
+
+void wifiMainLoop()
+{
+    char* linebuf = malloc(sizeof(char) * MAX_LINE_LENGTH);
 
     int c = sizeof(struct sockaddr_in);
     struct sockaddr_in client;
-
-    struct pollfd *pfds = malloc(sizeof *pfds * fd_size);
+    struct pollfd* pfds = malloc(sizeof(*pfds) * fd_size);
 
     int listenfd = setupServerSocket();
     pfds[0].fd = listenfd;
@@ -954,53 +1167,27 @@ int main()
     fd_count = 1;
 
     int newfd;
-	
-	Result rc;
-	int fr_count = 0;
-	
-    initFreezes();
-
-	// freeze thread
-	mutexInit(&freezeMutex);
-	rc = threadCreate(&freezeThread, sub_freeze, (void*)&freeze_thr_state, NULL, THREAD_SIZE, 0x2C, -2); 
-	if (R_SUCCEEDED(rc))
-        rc = threadStart(&freezeThread);
-
-    // touch thread
-    mutexInit(&touchMutex);
-    rc = threadCreate(&touchThread, sub_touch, (void*)&currentTouchEvent, NULL, THREAD_SIZE, 0x2C, -2); 
-    if (R_SUCCEEDED(rc))
-        rc = threadStart(&touchThread);
-
-    // key thread
-    mutexInit(&keyMutex);
-    rc = threadCreate(&keyboardThread, sub_key, (void*)&currentKeyEvent, NULL, THREAD_SIZE, 0x2C, -2); 
-    if (R_SUCCEEDED(rc))
-        rc = threadStart(&keyboardThread);
-
-    // click sequence thread
-    mutexInit(&clickMutex);
-    rc = threadCreate(&clickThread, sub_click, (void*)currentClick, NULL, THREAD_SIZE, 0x2C, -2); 
-    if (R_SUCCEEDED(rc))
-        rc = threadStart(&clickThread);
+    int fr_count = 0;
 
     flashLed();
 
     while (true)
     {
         poll(pfds, fd_count, -1);
-		mutexLock(&freezeMutex);
-        for(int i = 0; i < fd_count; i++) 
+        mutexLock(&freezeMutex);
+        for (int i = 0; i < fd_count; i++)
         {
-            if (pfds[i].revents & POLLIN) 
+            if (pfds[i].revents & POLLIN)
             {
-                if (pfds[i].fd == listenfd) 
+                if (pfds[i].fd == listenfd)
                 {
-                    newfd = accept(listenfd, (struct sockaddr *)&client, (socklen_t *)&c);
-                    if(newfd != -1)
+                    newfd = accept(listenfd, (struct sockaddr*)&client, (socklen_t*)&c);
+                    if (newfd != -1)
                     {
                         add_to_pfds(&pfds, newfd, &fd_count, &fd_size);
-                    }else{
+                    }
+                    else
+                    {
                         svcSleepThread(1e+9L);
                         close(listenfd);
                         listenfd = setupServerSocket();
@@ -1013,9 +1200,10 @@ int main()
                 {
                     bool readEnd = false;
                     int readBytesSoFar = 0;
-                    while(!readEnd){
+                    while (!readEnd)
+                    {
                         int len = recv(pfds[i].fd, &linebuf[readBytesSoFar], 1, 0);
-                        if(len <= 0)
+                        if (len <= 0)
                         {
                             close(pfds[i].fd);
                             del_from_pfds(pfds, i, &fd_count);
@@ -1024,7 +1212,8 @@ int main()
                         else
                         {
                             readBytesSoFar += len;
-                            if(linebuf[readBytesSoFar-1] == '\n'){
+                            if (linebuf[readBytesSoFar - 1] == '\n')
+                            {
                                 readEnd = true;
                                 linebuf[readBytesSoFar - 1] = 0;
 
@@ -1033,8 +1222,9 @@ int main()
 
                                 parseArgs(linebuf, &argmain);
 
-                                if(echoCommands){
-                                    printf("%s\n",linebuf);
+                                if (echoCommands)
+                                {
+                                    printf("%s\n", linebuf);
                                 }
                             }
                         }
@@ -1042,117 +1232,150 @@ int main()
                 }
             }
         }
-		fr_count = getFreezeCount(false);
-		if (fr_count == 0)
-			freeze_thr_state = Idle;
-		mutexUnlock(&freezeMutex);
+
+        fr_count = getFreezeCount(false);
+        if (fr_count == 0)
+            freeze_thr_state = Idle;
+        mutexUnlock(&freezeMutex);
         svcSleepThread(mainLoopSleepTime * 1e+6L);
     }
-	
-	if (R_SUCCEEDED(rc))
-    {
-	    freeze_thr_state = Exit;
-		threadWaitForExit(&freezeThread);
-        threadClose(&freezeThread);
-        currentTouchEvent.state = 3;
-        threadWaitForExit(&touchThread);
-        threadClose(&touchThread);
-        currentKeyEvent.state = 3;
-        threadWaitForExit(&keyboardThread);
-        threadClose(&keyboardThread);
-        clickThreadState = 1;
-        threadWaitForExit(&clickThread);
-	}
-	
-	clearFreezes();
-    freeFreezes();
-	
-    return 0;
 }
 
-void sub_freeze(void *arg)
+void usbMainLoop()
 {
-	u64 heap_base;
-	u64 tid_now = 0;
-	u64 pid = 0;
-	bool wait_su = false;
-	int freezecount = 0;
-	
-	IDLE:while (freezecount == 0)
-	{
-		if (*(FreezeThreadState*)arg == Exit)
-			break;
-		
-		// do nothing
-		svcSleepThread(1e+9L);
-		freezecount = getFreezeCount(false);
-	}
-	
-	while (1)
-	{
-		if (*(FreezeThreadState*)arg == Exit)
-			break;
-		
-		if (*(FreezeThreadState*)arg == Idle) // no freeze
-		{
-			mutexLock(&freezeMutex);
-			freeze_thr_state = Active;
-			mutexUnlock(&freezeMutex); // stupid but it works so is it really stupid? (yes)
-			freezecount = 0;
-			wait_su = false;
-			goto IDLE;
-		}
-        else if (*(FreezeThreadState*)arg == Pause)
+    USBResponse response;
+    int fr_count = 0;
+
+    flashLed();
+    while (true)
+    {
+        int lenUSB;
+        size_t len = usbCommsRead(&lenUSB, sizeof(lenUSB)); //Should use malloc
+        if (len <= 0)
         {
-            svcSleepThread(1e+8L); //1s
+            svcSleepThread(mainLoopSleepTime * 1e+6L);
             continue;
         }
-		
-		mutexLock(&freezeMutex);
-		attach();
-		heap_base = getHeapBase(debughandle);
-		pmdmntGetApplicationProcessId(&pid);
-		tid_now = getTitleId(pid);
-		detach();
-		
-		// don't freeze on startup of new tid to remove any chance of save corruption
-		if (tid_now == 0)
-		{
-			mutexUnlock(&freezeMutex);
-			svcSleepThread(1e+10L);
-			wait_su = true;
-			continue;
-		}
-		
-		if (wait_su)
-		{
-			mutexUnlock(&freezeMutex);
-			svcSleepThread(3e+10L);
-			wait_su = false;
-			mutexLock(&freezeMutex);
-		}
-		
-		if (heap_base > 0)
-		{
-			attach();
-			for (int j = 0; j < FREEZE_DIC_LENGTH; j++)
-			{
-				if (freezes[j].state == 1 && freezes[j].titleId == tid_now)
-				{
-					writeMem(heap_base + freezes[j].address, freezes[j].size, freezes[j].vData);
-				}
-			}
-			detach();
-		}
-		
-		mutexUnlock(&freezeMutex);
-		svcSleepThread(freezeRate * 1e+6L);
-		tid_now = 0;
-		pid = 0;
-	}
+
+        char linebufUSB[lenUSB + 1];
+        mutexLock(&freezeMutex);
+        for (int i = 0; i < lenUSB + 1; i++)
+            linebufUSB[i] = 0;
+
+        len = usbCommsRead(&linebufUSB, lenUSB);
+        bool failed = lenUSB - 2 > sizeof(linebufUSB) || len <= 0;
+        if (failed)
+        {
+            svcSleepThread(mainLoopSleepTime * 1e+6L);
+            mutexUnlock(&freezeMutex);
+            continue;
+        }
+
+        //Adds necessary escape characters for parser
+        linebufUSB[lenUSB - 1] = '\n';
+        linebufUSB[lenUSB - 2] = '\r';
+
+        fflush(stdout);
+        parseArgs(linebufUSB, &argmain);
+
+        if (echoCommands)
+        {
+            response.size = sizeof(linebufUSB);
+            response.data = &linebufUSB;
+            sendUsbResponse(response);
+        }
+
+        fr_count = getFreezeCount(false);
+        if (fr_count == 0)
+            freeze_thr_state = Idle;
+        mutexUnlock(&freezeMutex);
+        svcSleepThread(mainLoopSleepTime * 1e+6L);
+    }
 }
 
-void sub_touch(void *arg)
+void sub_freeze(void* arg)
+{
+    u64 heap_base;
+    u64 tid_now = 0;
+    u64 pid = 0;
+    bool wait_su = false;
+    int freezecount = 0;
+
+IDLE:while (freezecount == 0)
+{
+    if (*(FreezeThreadState*)arg == Exit)
+        break;
+
+    // do nothing
+    svcSleepThread(1e+9L);
+    freezecount = getFreezeCount(false);
+}
+
+while (1)
+{
+    if (*(FreezeThreadState*)arg == Exit)
+        break;
+
+    if (*(FreezeThreadState*)arg == Idle) // no freeze
+    {
+        mutexLock(&freezeMutex);
+        freeze_thr_state = Active;
+        mutexUnlock(&freezeMutex); // stupid but it works so is it really stupid? (yes)
+        freezecount = 0;
+        wait_su = false;
+        goto IDLE;
+    }
+    else if (*(FreezeThreadState*)arg == Pause)
+    {
+        svcSleepThread(1e+8L); //1s
+        continue;
+    }
+
+    mutexLock(&freezeMutex);
+    attach();
+    heap_base = getHeapBase(debughandle);
+    pmdmntGetApplicationProcessId(&pid);
+    tid_now = getTitleId(pid);
+    detach();
+
+    // don't freeze on startup of new tid to remove any chance of save corruption
+    if (tid_now == 0)
+    {
+        mutexUnlock(&freezeMutex);
+        svcSleepThread(1e+10L);
+        wait_su = true;
+        continue;
+    }
+
+    if (wait_su)
+    {
+        mutexUnlock(&freezeMutex);
+        svcSleepThread(3e+10L);
+        wait_su = false;
+        mutexLock(&freezeMutex);
+    }
+
+    if (heap_base > 0)
+    {
+        attach();
+        for (int j = 0; j < FREEZE_DIC_LENGTH; j++)
+        {
+            if (freezes[j].state == 1 && freezes[j].titleId == tid_now)
+            {
+                writeMem(heap_base + freezes[j].address, freezes[j].size, freezes[j].vData);
+            }
+        }
+        detach();
+    }
+
+    mutexUnlock(&freezeMutex);
+    svcSleepThread(freezeRate * 1e+6L);
+    tid_now = 0;
+    pid = 0;
+}
+}
+
+void sub_touch(void* arg)
 {
     while (1)
     {
@@ -1167,7 +1390,7 @@ void sub_touch(void *arg)
         }
 
         svcSleepThread(1e+6L);
-        
+
         touchToken = 0;
 
         if (touchPtr->state == 3)
@@ -1175,14 +1398,14 @@ void sub_touch(void *arg)
     }
 }
 
-void sub_key(void *arg)
+void sub_key(void* arg)
 {
     while (1)
     {
         KeyData* keyPtr = (KeyData*)arg;
         if (keyPtr->state == 1)
         {
-            mutexLock(&keyMutex); 
+            mutexLock(&keyMutex);
             key(keyPtr->states, keyPtr->sequentialCount);
             free(keyPtr->states);
             keyPtr->state = 0;
@@ -1196,7 +1419,7 @@ void sub_key(void *arg)
     }
 }
 
-void sub_click(void *arg)
+void sub_click(void* arg)
 {
     while (1)
     {
@@ -1213,7 +1436,78 @@ void sub_click(void *arg)
         }
 
         clickToken = 0;
-
         svcSleepThread(1e+6L);
+    }
+}
+
+bool isUSB()
+{
+    char str[4];
+    FILE* config = fopen("sdmc:/atmosphere/contents/430000000000000B/config.cfg", "r");
+    if (config)
+    {
+        fscanf(config, "%[^\n]", str);
+        fclose(config);
+        if (strcmp(strlwr(str), "wifi") == 0)
+            return false;
+    }
+    return true;
+}
+
+bool handle_connection()
+{
+    Result rc;
+    usb = isUSB();
+    if (usb)
+        rc = usbCommsInitialize();
+    else rc = socketInitializeDefault();
+
+    fsExit();
+    fsdevUnmountAll();
+
+    if (R_FAILED(rc))
+        return false;
+    return true;
+}
+
+void handle_disconnect()
+{
+    if (usb)
+        usbCommsExit();
+    else socketExit();
+}
+
+bool isConnectedToInternet(USBResponse* response)
+{
+    Result res = nifmInitialize(NifmServiceType_User);
+    if (R_FAILED(res))
+    {
+        sendResult(0, response);
+        return false;
+    }
+
+    NifmInternetConnectionStatus status;
+    res = nifmGetInternetConnectionStatus(NULL, NULL, &status);
+    if (R_FAILED(res) || status != NifmInternetConnectionStatus_Connected)
+    {
+        sendResult(0, response);
+        nifmExit();
+        return false;
+    }
+
+    return true;
+}
+
+void sendResult(uint16_t success, USBResponse* response)
+{
+    if (usb)
+    {
+        response->size = sizeof(uint16_t);
+        response->data = &success;
+        sendUsbResponse(*response);
+    }
+    else
+    {
+        printf("%u\n", success);
     }
 }

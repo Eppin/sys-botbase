@@ -14,6 +14,7 @@ HidDeviceType controllerInitializedType = HidDeviceType_FullKey3;
 HiddbgHdlsHandle controllerHandle = {0};
 HiddbgHdlsDeviceInfo controllerDevice = {0};
 HiddbgHdlsState controllerState = {0};
+USBResponse response;
 
 time_t curTime = 0;
 time_t origTime = 0;
@@ -90,7 +91,7 @@ u64 GetTitleVersion(u64 pid){
     s32 out;
 
     Result rc = nsInitialize();
-	if (R_FAILED(rc)) 
+    if (R_FAILED(rc)) 
         fatalThrow(rc);
 
     NsApplicationContentMetaStatus *MetaStatus = malloc(sizeof(NsApplicationContentMetaStatus[100U]));
@@ -170,20 +171,16 @@ void initController()
     if(bControllerIsInitialised) return;
     //taken from switchexamples github
     Result rc = hiddbgInitialize();
-	
-	//old
-    //if (R_FAILED(rc) && debugResultCodes)
-    //printf("hiddbgInitialize: %d\n", rc);
-    
-	//new
+
 	if (R_FAILED(rc) && debugResultCodes) {
         printf("hiddbgInitialize(): 0x%x\n", rc);
     }
     else {
         workmem = aligned_alloc(0x1000, workmem_size);
-        if (workmem) initflag = 1;
+        if (workmem)
+            initflag = 1;
         else printf("workmem alloc failed\n");
-    }    
+    }
 	
 	// Set the controller type to Pro-Controller, and set the npadInterfaceType.
     controllerDevice.deviceType = controllerInitializedType;
@@ -225,7 +222,6 @@ void detachController()
     hiddbgExit();
 	free(workmem);
     bControllerIsInitialised = false;
-
     sessionId.id = 0;
 }
 
@@ -238,7 +234,7 @@ void poke(u64 offset, u64 size, u8* val)
 
 void writeMem(u64 offset, u64 size, u8* val)
 {
-	Result rc = svcWriteDebugProcessMemory(debughandle, val, offset, size);
+    Result rc = svcWriteDebugProcessMemory(debughandle, val, offset, size);
     if (R_FAILED(rc) && debugResultCodes)
         printf("svcWriteDebugProcessMemory: %d\n", rc);
 }
@@ -250,12 +246,19 @@ void peek(u64 offset, u64 size)
     readMem(out, offset, size);
     detach();
 
-    u64 i;
-    for (i = 0; i < size; i++)
+    if (usb)
     {
-        printf("%02X", out[i]);
+        response.size = size;
+        response.data = &out[0];
+        sendUsbResponse(response);
     }
-    printf("\n");
+    else
+    {
+        u64 i;
+        for (i = 0; i < size; i++)
+            printf("%02X", out[i]);
+        printf("\n");
+    }
     free(out);
 }
 
@@ -263,8 +266,8 @@ void peekInfinite(u64 offset, u64 size)
 {
     u64 sizeRemainder = size;
     u64 totalFetched = 0;
-    u64 i;
     u8 *out = malloc(sizeof(u8) * MAX_LINE_LENGTH);
+    u8 *usbOut = malloc(size);
 
     attach();
     while (sizeRemainder > 0)
@@ -272,16 +275,29 @@ void peekInfinite(u64 offset, u64 size)
         u64 thisBuffersize = sizeRemainder > MAX_LINE_LENGTH ? MAX_LINE_LENGTH : sizeRemainder;
         sizeRemainder -= thisBuffersize;
         readMem(out, offset + totalFetched, thisBuffersize);
+
+        u64 i;
         for (i = 0; i < thisBuffersize; i++)
         {
-            printf("%02X", out[i]);
+            if (usb)
+                usbOut[totalFetched + i] = out[i];
+            else printf("%02X", out[i]);
         }
 
         totalFetched += thisBuffersize;
     }
+
     detach();
-    printf("\n");
+    if (usb)
+    {
+        response.size = size;
+        response.data = &usbOut[0];
+        sendUsbResponse(response);
+    }
+    else printf("\n");
+
     free(out);
+    free(usbOut);
 }
 
 void peekMulti(u64* offset, u64* size, u64 count)
@@ -300,18 +316,25 @@ void peekMulti(u64* offset, u64* size, u64 count)
     }
     detach();
 
-    u64 i;
-    for (i = 0; i < totalSize; i++)
+    if (usb)
     {
-        printf("%02X", out[i]);
+        response.size = totalSize;
+        response.data = &out[0];
+        sendUsbResponse(response);
     }
-    printf("\n");
+    else
+    {
+        u64 i;
+        for (i = 0; i < totalSize; i++)
+            printf("%02X", out[i]);
+        printf("\n");
+    }
     free(out);
 }
 
 void readMem(u8* out, u64 offset, u64 size)
 {
-	Result rc = svcReadDebugProcessMemory(out, debughandle, offset, size);
+    Result rc = svcReadDebugProcessMemory(out, debughandle, offset, size);
     if (R_FAILED(rc) && debugResultCodes)
         printf("svcReadDebugProcessMemory: %d\n", rc);
 }
@@ -346,15 +369,15 @@ void setStickState(int side, int dxVal, int dyVal)
 {
     initController();
     if (side == JOYSTICK_LEFT)
-    {	
+    {
         controllerState.analog_stick_l.x = dxVal;
-		controllerState.analog_stick_l.y = dyVal;
-	}
-	else
-	{
-		controllerState.analog_stick_r.x = dxVal;
-		controllerState.analog_stick_r.y = dyVal;
-	}
+        controllerState.analog_stick_l.y = dyVal;
+    }
+    else
+    {
+        controllerState.analog_stick_r.x = dxVal;
+        controllerState.analog_stick_r.y = dyVal;
+    }
     hiddbgSetHdlsState(controllerHandle, &controllerState);
 }
 
@@ -373,26 +396,26 @@ void reverseArray(u8* arr, int start, int end)
 
 u64 followMainPointer(s64* jumps, size_t count) 
 {
-	u64 offset;
+    u64 offset;
     u64 size = sizeof offset;
-	u8 *out = malloc(size);
-	MetaData meta = getMetaData(); 
-	
-	attach();
-	readMem(out, meta.main_nso_base + jumps[0], size);
-	offset = *(u64*)out;
-	int i;
+    u8* out = malloc(size);
+    MetaData meta = getMetaData(); 
+    
+    attach();
+    readMem(out, meta.main_nso_base + jumps[0], size);
+    offset = *(u64*)out;
+    int i;
     for (i = 1; i < count; ++i)
-	{
-		readMem(out, offset + jumps[i], size);
-		offset = *(u64*)out;
+    {
+        readMem(out, offset + jumps[i], size);
+        offset = *(u64*)out;
         // this traversal resulted in an error
         if (offset == 0)
             break;
-	}
-	detach();
-	free(out);
-	
+    }
+    detach();
+    free(out);
+    
     return offset;
 }
 
@@ -528,6 +551,13 @@ void clickSequence(char* seq, u8* token)
 
         command = strtok(NULL, &delim);
     }
+}
+
+void sendUsbResponse(USBResponse response)
+{
+    usbCommsWrite((void*)&response, 4);
+    if (response.size > 0)
+        usbCommsWrite(response.data, response.size);
 }
 
 void dateSet(uint64_t date)
