@@ -30,8 +30,13 @@ information. */
 #include <netinet/in.h>
 #include <switch.h>
 #include <sys/socket.h>
+#include <stdio.h>
 
 time_t ntpGetTime() {
+    Result si = socketInitializeDefault();
+    if (R_FAILED(si))
+        return 0;
+
     static const char* SERVER_NAME = "0.pool.ntp.org";
     int sockfd = -1;
     sockfd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -53,5 +58,6 @@ time_t ntpGetTime() {
     (size_t)(recv(sockfd, (char*)&packet, sizeof(ntp_packet), 0));
     packet.txTm_s = ntohl(packet.txTm_s);
 
+    socketExit();
     return (time_t)(packet.txTm_s - NTP_TIMESTAMP_DELTA);
 }
